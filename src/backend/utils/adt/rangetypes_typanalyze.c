@@ -37,6 +37,8 @@ static int	range_bound_qsort_cmp(const void *a1, const void *a2, void *arg);
 static void compute_range_stats(VacAttrStats *stats,
 								AnalyzeAttrFetchFunc fetchfunc, int samplerows,
 								double totalrows);
+static float4 cal_power(TypeCacheEntry *typcache,
+						const RangeBound *hist, int old_pos, int post);
 
 /*
  * range_typanalyze -- typanalyze function for range columns
@@ -58,6 +60,8 @@ range_typanalyze(PG_FUNCTION_ARGS)
 	stats->extra_data = typcache;
 	/* same as in std_typanalyze */
 	stats->minrows = 300 * attr->attstattarget;
+	printf("minrows: %d\n", stats->minrows);
+	fflush(stdout);
 
 	PG_RETURN_BOOL(true);
 }
@@ -117,6 +121,39 @@ range_bound_qsort_cmp(const void *a1, const void *a2, void *arg)
 	TypeCacheEntry *typcache = (TypeCacheEntry *) arg;
 
 	return range_cmp_bounds(typcache, b1, b2);
+}
+
+/*
+ * cal_power() -- calculate the power of the approximate function 
+ * which represents a power-low distribution fitting the discrete 
+ * data from start to end in hist.
+ */
+static float4 
+cal_power(TypeCacheEntry *typcache,
+ 		  const RangeBound *hist, int start, int end)
+{
+	int 		mid;
+	float 		diff_m_s;
+	float	  	diff_e_s;
+
+	if (start <= end + 1)
+	{
+		return 1.0;
+	}
+
+	diff_e_s = DatumGetFloat4(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+												typcache->rng_collation,
+												hist[end].val, hist[start].val));
+	if (diff_e_s == 0) 
+	{
+		return 1.0;
+	}
+
+	mid = (start + end) / 2;
+	diff_m_s = DatumGetFloat4(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+												typcache->rng_collation,
+												hist[mid].val, hist[start].val));
+	return 1.0;
 }
 
 /*
@@ -254,8 +291,10 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	{
 		Datum	   *bound_hist_values;
 		Datum	   *length_hist_values;
+		float4	   *power_values;
 		int			pos,
 					posfrac,
+					old_pos,
 					delta,
 					deltafrac,
 					i;
@@ -292,6 +331,12 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			bound_hist_values = (Datum *) palloc(num_hist * sizeof(Datum));
 
 			/*
+			 * Each bin of lower histogram and upper histogram has a related 
+			 * power value. 
+			 */
+			power_values =  (float4 *) palloc(2 * (num_hist - 1) * sizeof(float4));
+
+			/*
 			 * The object of this loop is to construct ranges from first and
 			 * last entries in lowers[] and uppers[] along with evenly-spaced
 			 * values in between. So the i'th value is a range of lowers[(i *
@@ -305,13 +350,20 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			delta = (non_empty_cnt - 1) / (num_hist - 1);
 			deltafrac = (non_empty_cnt - 1) % (num_hist - 1);
 			pos = posfrac = 0;
-
+			old_pos = 0;
+			
 			for (i = 0; i < num_hist; i++)
 			{
 				bound_hist_values[i] = PointerGetDatum(range_serialize(typcache,
 																	   &lowers[pos],
 																	   &uppers[pos],
 																	   false));
+				if (i > 0)
+				{
+					power_values[i - 1] = cal_power(typcache, lowers, old_pos, pos);
+					power_values[i - 1 + (num_hist - 1)] = cal_power(typcache, uppers, old_pos, pos);
+					old_pos = pos;
+				}
 				pos += delta;
 				posfrac += deltafrac;
 				if (posfrac >= (num_hist - 1))
@@ -325,6 +377,9 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			stats->stakind[slot_idx] = STATISTIC_KIND_BOUNDS_HISTOGRAM;
 			stats->stavalues[slot_idx] = bound_hist_values;
 			stats->numvalues[slot_idx] = num_hist;
+
+			stats->stanumbers[slot_idx] = power_values;
+			stats->numnumbers[slot_idx] = 2 * (num_hist - 1);
 
 			/* Store ranges even if we're analyzing a multirange column */
 			stats->statypid[slot_idx] = typcache->type_id;

@@ -40,6 +40,15 @@ static double calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
 										   const RangeBound *constbound,
 										   const RangeBound *hist, int hist_nvalues,
 										   bool equal);
+
+double _calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
+									const RangeBound *constbound,
+									const RangeBound *hist, int hist_nvalues,
+									bool equal)
+{
+	return calc_hist_selectivity_scalar(typcache, constbound, hist, hist_nvalues, equal);
+}
+
 static int	rbound_bsearch(TypeCacheEntry *typcache, const RangeBound *value,
 						   const RangeBound *hist, int hist_length, bool equal);
 static float8 get_position(TypeCacheEntry *typcache, const RangeBound *value,

@@ -42,3 +42,8 @@ lib*.pc
 /Debug/
 /Release/
 /tmp_install/
+
+# Personal
+.vscode
+.gitignore
+.DS_Store

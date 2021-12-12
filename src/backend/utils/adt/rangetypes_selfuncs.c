@@ -40,7 +40,8 @@ static double calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
 										   const RangeBound *constbound,
 										   const RangeBound *hist, int hist_nvalues,
 										   bool equal);
-
+static double calc_hist_selectivity_scalar_m(TypeCacheEntry *typcache, const RangeBound *constbound, 
+								const RangeBound *hist, int hist_nvalues,float8 *m,bool equal);
 double _calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
 									const RangeBound *constbound,
 									const RangeBound *hist, int hist_nvalues,
@@ -53,6 +54,8 @@ static int	rbound_bsearch(TypeCacheEntry *typcache, const RangeBound *value,
 						   const RangeBound *hist, int hist_length, bool equal);
 static float8 get_position(TypeCacheEntry *typcache, const RangeBound *value,
 						   const RangeBound *hist1, const RangeBound *hist2);
+static float8 get_position_m(TypeCacheEntry *typcache, const RangeBound *value, const RangeBound *hist1,
+			 const RangeBound *hist2,float8 *m);
 static float8 get_len_position(double value, double hist1, double hist2);
 static float8 get_distance(TypeCacheEntry *typcache, const RangeBound *bound1,
 						   const RangeBound *bound2);
@@ -393,6 +396,9 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	bool		empty;
 	double		hist_selec;
 
+	float8     *lowers_m;
+	float8     *uppers_m;
+
 	/* Can't use the histogram with insecure range support functions */
 	if (!statistic_proc_security_check(vardata,
 									   typcache->rng_cmp_proc_finfo.fn_oid))
@@ -416,6 +422,10 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 		return -1.0;
 	}
 
+
+	lowers_m = (float8 *) palloc(sizeof(float8)*(int)hslot.nnumbers/2);
+	uppers_m = (float8 *) palloc(sizeof(float8)*(int)hslot.nnumbers/2);
+	
 	/*
 	 * Convert histogram of ranges into histograms of its lower and upper
 	 * bounds.
@@ -461,6 +471,25 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	range_deserialize(typcache, constval, &const_lower, &const_upper, &empty);
 	Assert(!empty);
 
+	////////////////////////////////////////////////////////////////
+	for (size_t i = 0; i < hslot.nnumbers; i++)
+	{
+		if (i<hslot.nnumbers/2)
+		{
+			lowers_m[i] = (float8)hslot.numbers[i];
+			printf("lowers_m[%d]=%f",i,lowers_m[i]);
+			fflush(stdout);
+		}else{
+			uppers_m[i-hslot.nnumbers/2] = (float8)hslot.numbers[i];
+			printf("uppers_m[%d]=%f",i,uppers_m[i-hslot.nnumbers/2]);
+			fflush(stdout);
+		}
+		
+	}
+	printf("%f \n%f\n lowers_m and uppers_m pass",lowers_m[0],uppers_m[0]);
+	fflush(stdout);
+	////////////////////////////////////////////////////////////////
+
 	/*
 	 * Calculate selectivity comparing the lower or upper bound of the
 	 * constant with the histogram of lower or upper bounds.
@@ -503,8 +532,8 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 		case OID_RANGE_LEFT_OP:
 			/* var << const when upper(var) < lower(const) */
 			hist_selec =
-				calc_hist_selectivity_scalar(typcache, &const_lower,
-											 hist_upper, nhist, false);
+				calc_hist_selectivity_scalar_m(typcache, &const_lower,
+											 hist_upper, nhist, uppers_m,false);
 			break;
 
 		case OID_RANGE_RIGHT_OP:
@@ -592,10 +621,122 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 
 	free_attstatsslot(&lslot);
 	free_attstatsslot(&hslot);
+	pfree(lowers_m);
+	pfree(uppers_m);
+	printf("free memory pass");
+	fflush(stdout);
 
 	return hist_selec;
 }
 
+static double
+calc_hist_selectivity_scalar_m(TypeCacheEntry *typcache, const RangeBound *constbound, 
+								const RangeBound *hist, int hist_nvalues,float8 *m,bool equal)
+{	
+	Selectivity selec;
+	int			index;
+
+	index = rbound_bsearch(typcache, constbound, hist, hist_nvalues, equal);
+	selec = (Selectivity) (Max(index, 0)) / (Selectivity) (hist_nvalues - 1);
+
+	printf("m=%f\n",*m);
+	fflush(stdout);
+
+	if (index >= 0 && index < hist_nvalues - 1)
+		selec += get_position_m(typcache, constbound, &hist[index],
+							  &hist[index + 1],&m[index]) / (Selectivity) (hist_nvalues - 1);
+	printf("get_position_m pass\n");
+	fflush(stdout);
+	return selec;
+}
+
+static float8
+get_position_m(TypeCacheEntry *typcache, const RangeBound *value, const RangeBound *hist1,
+			 const RangeBound *hist2,float8 *m)
+{
+	bool		has_subdiff = OidIsValid(typcache->rng_subdiff_finfo.fn_oid);
+	float8		position;
+
+	if (!hist1->infinite && !hist2->infinite)
+	{
+		float8		bin_width;
+		float8	    delta_y;
+
+		/*
+		 * Both bounds are finite. Assuming the subtype's comparison function
+		 * works sanely, the value must be finite, too, because it lies
+		 * somewhere between the bounds.  If it doesn't, arbitrarily return
+		 * 0.5.
+		 */
+		if (value->infinite)
+			return 0.5;
+
+		/* Can't interpolate without subdiff function */
+		if (!has_subdiff)
+			return 0.5;
+
+		/* Calculate relative position using subdiff function. */
+		bin_width = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+													 typcache->rng_collation,
+													 hist2->val,
+													 hist1->val));
+		if (isnan(bin_width) || bin_width <= 0.0)
+			return 0.5;			/* punt for NaN or zero-width bin */
+
+		// value->val 换成我要求的x
+
+
+		// position = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+		// 											typcache->rng_collation,
+		// 											value->val,
+		// 											hist1->val))
+		// 	/ bin_width;
+
+		delta_y = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+													typcache->rng_collation,
+													value->val,
+													hist1->val));
+		printf("delta_y pass\n");
+		fflush(stdout);
+		position = exp(log(delta_y / bin_width) / *m);
+		printf("postion=%f pass\n",position);
+		fflush(stdout);
+		if (isnan(position))
+			return 0.5;			/* punt for NaN from subdiff, Inf/Inf, etc */
+
+		/* Relative position must be in [0,1] range */
+		position = Max(position, 0.0);
+		position = Min(position, 1.0);
+		return position;
+	}
+	else if (hist1->infinite && !hist2->infinite)
+	{
+		/*
+		 * Lower bin boundary is -infinite, upper is finite. If the value is
+		 * -infinite, return 0.0 to indicate it's equal to the lower bound.
+		 * Otherwise return 1.0 to indicate it's infinitely far from the lower
+		 * bound.
+		 */
+		return ((value->infinite && value->lower) ? 0.0 : 1.0);
+	}
+	else if (!hist1->infinite && hist2->infinite)
+	{
+		/* same as above, but in reverse */
+		return ((value->infinite && !value->lower) ? 1.0 : 0.0);
+	}
+	else
+	{
+		/*
+		 * If both bin boundaries are infinite, they should be equal to each
+		 * other, and the value should also be infinite and equal to both
+		 * bounds. (But don't Assert that, to avoid crashing if a user creates
+		 * a datatype with a broken comparison function).
+		 *
+		 * Assume the value to lie in the middle of the infinite bounds.
+		 */
+		return 0.5;
+	}
+}
 
 /*
  * Look up the fraction of values less than (or equal, if 'equal' argument

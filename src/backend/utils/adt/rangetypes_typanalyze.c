@@ -291,7 +291,12 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	{
 		Datum	   *bound_hist_values;
 		Datum	   *length_hist_values;
-		float4	   *power_values;
+		//////////////////////////////////////
+		float4     *lowers_m,
+				   *uppers_m,
+				   *m;
+		//////////////////////////////////////
+		// float4	   *power_values;
 		int			pos,
 					posfrac,
 					old_pos,
@@ -300,7 +305,10 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 					i;
 		MemoryContext old_cxt;
 		float4	   *emptyfrac;
-
+		/////////////////////////////////////
+		int         lowers_m_len;
+		int         uppers_m_len;
+		/////////////////////////////////////
 		stats->stats_valid = true;
 		/* Do the simple null-frac and width stats */
 		stats->stanullfrac = (double) null_cnt / (double) samplerows;
@@ -330,11 +338,18 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 
 			bound_hist_values = (Datum *) palloc(num_hist * sizeof(Datum));
 
+			/////////////////////////////////////////////////////////
+			lowers_m = (float8 *) palloc(num_hist * sizeof(float8));
+			uppers_m = (float8 *) palloc(num_hist * sizeof(float8));
+			m = (float4 *) palloc(2*num_hist * sizeof(float4));
+			/////////////////////////////////////////////////////////
+			printf("alloc memory pass\n");
+			fflush(stdout);
 			/*
 			 * Each bin of lower histogram and upper histogram has a related 
 			 * power value. 
 			 */
-			power_values =  (float4 *) palloc(2 * (num_hist - 1) * sizeof(float4));
+			// power_values =  (float4 *) palloc(2 * (num_hist - 1) * sizeof(float4));
 
 			/*
 			 * The object of this loop is to construct ranges from first and
@@ -358,10 +373,80 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 																	   &lowers[pos],
 																	   &uppers[pos],
 																	   false));
+				if (i>0){
+
+																	   
+				float8 lower_m;
+				float8 lower_max_min;
+				float8 lower_mid_min;
+
+				lower_max_min = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														   lowers[pos].val,lowers[old_pos].val));
+				if (delta%2==0){
+					lower_mid_min = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														   lowers[pos-delta/2].val,lowers[old_pos].val));
+				}else{
+					lower_mid_min = (DatumGetFloat8(FunctionCall2Coll(
+									&typcache->rng_subdiff_finfo,
+									typcache->rng_collation,
+									lowers[pos-(delta-1)/2].val,lowers[old_pos].val))
+									+
+									DatumGetFloat8(FunctionCall2Coll(
+									&typcache->rng_subdiff_finfo,
+									typcache->rng_collation,
+									lowers[pos-(delta+1)/2].val,lowers[old_pos].val)))
+									/2;
+				}
+				printf("lower_max_min=%f\n",lower_max_min);
+				printf("lower_mid_min=%f\n",lower_mid_min);
+				if(lower_max_min == 0 || lower_mid_min == 0){
+					lower_m = 1;
+				}else{					
+					lower_m = log(lower_max_min/lower_mid_min)/log(2);
+				}
+				printf("lower_m=%f\n",lower_m);
+				lowers_m[i-1] = lower_m;
+
+				float8 upper_m;
+				float8 upper_max_min;
+				float8 upper_mid_min;
+
+				upper_max_min = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														   uppers[pos].val,uppers[old_pos].val));
+				if (delta%2==0){
+					upper_mid_min = DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+														  typcache->rng_collation,
+														   uppers[pos-delta/2].val,uppers[old_pos].val));
+				}else{
+					upper_mid_min = (DatumGetFloat8(FunctionCall2Coll(
+									&typcache->rng_subdiff_finfo,
+									typcache->rng_collation,
+									uppers[pos-(delta-1)/2].val,uppers[old_pos].val))
+									+
+									DatumGetFloat8(FunctionCall2Coll(
+									&typcache->rng_subdiff_finfo,
+									typcache->rng_collation,
+									uppers[pos-(delta+1)/2].val,uppers[old_pos].val)))
+									/2;
+				}
+				printf("upper_max_min=%f\n",upper_max_min);
+				printf("upper_mid_min=%f\n",upper_mid_min);
+				if(upper_max_min == 0 || upper_mid_min == 0){
+					upper_m = 1;
+				}else{					
+					upper_m = log(upper_max_min/upper_mid_min)/log(2);
+				}
+				printf("upper_m=%f\n",upper_m);
+				uppers_m[i-1] = upper_m;
+				}
+
+				
+
 				if (i > 0)
 				{
-					power_values[i - 1] = cal_power(typcache, lowers, old_pos, pos);
-					power_values[i - 1 + (num_hist - 1)] = cal_power(typcache, uppers, old_pos, pos);
 					old_pos = pos;
 				}
 				pos += delta;
@@ -374,18 +459,40 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 				}
 			}
 
+			lowers_m_len = num_hist-1;
+			uppers_m_len = num_hist-1;
+			for (i = 0; i <lowers_m_len+uppers_m_len; i++){
+				if (i < lowers_m_len){
+					m[i] = (float4)lowers_m[i];
+				}else{
+					m[i] = (float4)uppers_m[i-lowers_m_len];
+				}
+				
+			}
+
 			stats->stakind[slot_idx] = STATISTIC_KIND_BOUNDS_HISTOGRAM;
 			stats->stavalues[slot_idx] = bound_hist_values;
 			stats->numvalues[slot_idx] = num_hist;
 
-			stats->stanumbers[slot_idx] = power_values;
-			stats->numnumbers[slot_idx] = 2 * (num_hist - 1);
 
 			/* Store ranges even if we're analyzing a multirange column */
 			stats->statypid[slot_idx] = typcache->type_id;
 			stats->statyplen[slot_idx] = typcache->typlen;
 			stats->statypbyval[slot_idx] = typcache->typbyval;
 			stats->statypalign[slot_idx] = typcache->typalign;
+
+			stats->numnumbers[slot_idx] = lowers_m_len+uppers_m_len;
+			stats->stanumbers[slot_idx] = m;
+
+			printf("numnumbers=%d\n",stats->numnumbers[slot_idx]);
+			fflush(stdout);
+
+			for (size_t i = 0; i < lowers_m_len+uppers_m_len; i++)
+			{
+				printf("m[%d]=%f\n",i,m[i]);
+				fflush(stdout);
+			}
+			
 
 			slot_idx++;
 		}

@@ -531,6 +531,8 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 
 		case OID_RANGE_LEFT_OP:
 			/* var << const when upper(var) < lower(const) */
+			printf("into left case.");
+			fflush(stdout);
 			hist_selec =
 				calc_hist_selectivity_scalar_m(typcache, &const_lower,
 											 hist_upper, nhist, uppers_m,false);
@@ -571,12 +573,14 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 			 * caller already constructed the singular range from the element
 			 * constant, so just treat it the same as &&.
 			 */
+			printf("into overlap case");
+			fflush(stdout);
 			hist_selec =
-				calc_hist_selectivity_scalar(typcache, &const_lower, hist_upper,
-											 nhist, false);
+				calc_hist_selectivity_scalar_m(typcache, &const_lower, hist_upper,
+											 nhist, uppers_m,false);
 			hist_selec +=
-				(1.0 - calc_hist_selectivity_scalar(typcache, &const_upper, hist_lower,
-													nhist, true));
+				(1.0 - calc_hist_selectivity_scalar_m(typcache, &const_upper, hist_lower,
+													nhist,lowers_m, true));
 			hist_selec = 1.0 - hist_selec;
 			break;
 
@@ -623,7 +627,7 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	free_attstatsslot(&hslot);
 	pfree(lowers_m);
 	pfree(uppers_m);
-	printf("free memory pass");
+	// printf("free memory pass");
 	fflush(stdout);
 
 	return hist_selec;
@@ -643,10 +647,12 @@ calc_hist_selectivity_scalar_m(TypeCacheEntry *typcache, const RangeBound *const
 	fflush(stdout);
 
 	if (index >= 0 && index < hist_nvalues - 1)
+		printf("into this brench.");
+		fflush(stdout);
 		selec += get_position_m(typcache, constbound, &hist[index],
 							  &hist[index + 1],&m[index]) / (Selectivity) (hist_nvalues - 1);
-	printf("get_position_m pass\n");
-	fflush(stdout);
+	// printf("get_position_m pass\n");
+	// fflush(stdout);
 	return selec;
 }
 
@@ -696,8 +702,8 @@ get_position_m(TypeCacheEntry *typcache, const RangeBound *value, const RangeBou
 													typcache->rng_collation,
 													value->val,
 													hist1->val));
-		printf("delta_y pass\n");
-		fflush(stdout);
+		printf("delta_y=%f pass\n",delta_y);
+		// fflush(stdout);
 		position = exp(log(delta_y / bin_width) / *m);
 		printf("postion=%f pass\n",position);
 		fflush(stdout);

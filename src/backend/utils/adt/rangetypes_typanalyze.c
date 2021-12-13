@@ -343,8 +343,8 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			uppers_m = (float8 *) palloc(num_hist * sizeof(float8));
 			m = (float4 *) palloc(2*num_hist * sizeof(float4));
 			/////////////////////////////////////////////////////////
-			printf("alloc memory pass\n");
-			fflush(stdout);
+			// printf("alloc memory pass\n");
+			// fflush(stdout);
 			/*
 			 * Each bin of lower histogram and upper histogram has a related 
 			 * power value. 
@@ -399,14 +399,14 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 									lowers[pos-(delta+1)/2].val,lowers[old_pos].val)))
 									/2;
 				}
-				printf("lower_max_min=%f\n",lower_max_min);
-				printf("lower_mid_min=%f\n",lower_mid_min);
+				// printf("lower_max_min=%f\n",lower_max_min);
+				// printf("lower_mid_min=%f\n",lower_mid_min);
 				if(lower_max_min == 0 || lower_mid_min == 0){
 					lower_m = 1;
 				}else{					
 					lower_m = log(lower_max_min/lower_mid_min)/log(2);
 				}
-				printf("lower_m=%f\n",lower_m);
+				// printf("lower_m=%f\n",lower_m);
 				lowers_m[i-1] = lower_m;
 
 				float8 upper_m;
@@ -432,14 +432,14 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 									uppers[pos-(delta+1)/2].val,uppers[old_pos].val)))
 									/2;
 				}
-				printf("upper_max_min=%f\n",upper_max_min);
-				printf("upper_mid_min=%f\n",upper_mid_min);
+				// printf("upper_max_min=%f\n",upper_max_min);
+				// printf("upper_mid_min=%f\n",upper_mid_min);
 				if(upper_max_min == 0 || upper_mid_min == 0){
 					upper_m = 1;
 				}else{					
 					upper_m = log(upper_max_min/upper_mid_min)/log(2);
 				}
-				printf("upper_m=%f\n",upper_m);
+				// printf("upper_m=%f\n",upper_m);
 				uppers_m[i-1] = upper_m;
 				}
 
@@ -484,14 +484,14 @@ compute_range_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			stats->numnumbers[slot_idx] = lowers_m_len+uppers_m_len;
 			stats->stanumbers[slot_idx] = m;
 
-			printf("numnumbers=%d\n",stats->numnumbers[slot_idx]);
-			fflush(stdout);
+			// printf("numnumbers=%d\n",stats->numnumbers[slot_idx]);
+			// fflush(stdout);
 
-			for (size_t i = 0; i < lowers_m_len+uppers_m_len; i++)
-			{
-				printf("m[%d]=%f\n",i,m[i]);
-				fflush(stdout);
-			}
+			// for (size_t i = 0; i < lowers_m_len+uppers_m_len; i++)
+			// {
+			// 	printf("m[%d]=%f\n",i,m[i]);
+			// 	fflush(stdout);
+			// }
 			
 
 			slot_idx++;

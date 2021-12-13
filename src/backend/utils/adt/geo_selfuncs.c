@@ -67,41 +67,33 @@ double calc_hist_selectivity_hist(TypeCacheEntry *typcache,
     memset(area_values, 0, sizeof(double) * (nhist1 - 1));
     selec = 0;
     
-    /* loop until finishing traversing all range bounds in hist1 */
+    /* Loop until all range bounds in hist1 are processed */
     while (idx1 < nhist1)
     {
-        if (idx2 >= nhist2)
+        if (idx2 < nhist2)
         {
-            // finished reading lower2
-            if (cur_bin_idx < 0)
-            {
-                // area of every bin in upper1 is 0, finish
-                break;
-            }
-            else
-            {
-                area_values[cur_bin_idx] = (cur_bin_height == 0) ? 0 : cur_bin_area / cur_bin_height;
-                cur_bin_area = 0;
-                cur_bin_height = 0;
-                cur_bin_idx++;
-                idx1++;
-            }
-        }
-        else
-        {
+            /* 
+             * There are range bounds remained unprocessed for both of hist1 and hist2.
+             * Chose and process the smaller one between hist1[idx1] and hist2[idx2].
+             * 
+             * If hist1[idx1] is not greater, compute the area of current trapezoid and 
+             * add it to the accumulated area within the current bin, then calculate
+             * the average area per unit bin length as the join cardinality estimation
+             * of the single bin.
+             * 
+             * Otherwise, only compute the area of current trapezoid and add it to the 
+             * accumulated area within the current bin.
+             */
             if (range_cmp_bounds(typcache, &hist1[idx1], &hist2[idx2]) <= 0)
             {
-                // upper is smaller
                 chosed_bound = &hist1[idx1];
                 cur_selec = 1 - _calc_hist_selectivity_scalar(typcache, chosed_bound, hist2, nhist2, equal);
                 if (cur_bin_idx < 0)
                 {
-                    // first bin
                     cur_bin_idx = 0;
                 }
                 else
                 {
-                    // finish a bin and move to a new one
                     trapezoid_base2 = cur_selec;
                     trapezoid_height = (double) DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
                                                                                 typcache->rng_collation,
@@ -121,7 +113,6 @@ double calc_hist_selectivity_hist(TypeCacheEntry *typcache,
             }
             else
             {
-                // lower is smaller
                 chosed_bound = &hist2[idx2];
                 cur_selec = 1 - idx2 / (nhist2 - 1.0);
                 if (cur_bin_idx < 0)
@@ -142,8 +133,29 @@ double calc_hist_selectivity_hist(TypeCacheEntry *typcache,
                 idx2++;
             }
         }
+        else
+        {
+            /*
+             * all range bounds in hist2 have been processed.
+             *
+             * If it haven't reached any bin in hist1 yet, area of all bins in upper1 
+             * is 0, finished.
+             * 
+             * Otherwise, calculate the average area per unit bin length as the join 
+             * cardinality of the last bin. Area of all following bin is 0，finished.
+             */
+            if (cur_bin_idx < 0)
+            {
+                break;
+            }
+            else
+            {
+                area_values[cur_bin_idx] = (cur_bin_height == 0) ? 0 : cur_bin_area / cur_bin_height;
+                break;
+            }
+        }
     }
-    
+
     printf("area_values = [");
     for (i = 0; i < (nhist1 - 1); i++)
     {
@@ -153,7 +165,7 @@ double calc_hist_selectivity_hist(TypeCacheEntry *typcache,
             printf(", ");
     }
     printf("]\n");
-    pfree(area_values);
+    pfree(area_values);    
     selec /= (nhist1 - 1);
     return selec;
 }

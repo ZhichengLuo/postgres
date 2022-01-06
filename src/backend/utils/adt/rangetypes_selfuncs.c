@@ -755,11 +755,13 @@ calc_hist_join_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata1,
 		case OID_RANGE_LEFT_OP:
 			hist_join_selec = 
 				calc_hist_join_selectivity_hist(typcache, hist1_upper, nhist1, hist2_lower, nhist2, false);
+			break;
 
 		case OID_RANGE_RIGHT_OP:
 			hist_join_selec = 
 				calc_hist_join_selectivity_hist(typcache, hist2_upper, nhist2, hist1_lower, nhist1, false);
-
+			break;
+			
 		default:
 			elog(ERROR, "unknown range operator %u", operator);
 			hist_join_selec = -1.0;	/* keep compiler quiet */

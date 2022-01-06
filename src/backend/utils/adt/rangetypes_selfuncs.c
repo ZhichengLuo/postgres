@@ -33,6 +33,7 @@
 static double calc_rangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
 							const RangeType *constval, Oid operator);
 static double default_range_selectivity(Oid operator);
+static double default_range_join_selectivity(Oid operator);
 static double calc_hist_selectivity(TypeCacheEntry *typcache,
 									VariableStatData *vardata, const RangeType *constval,
 									Oid operator);
@@ -40,6 +41,13 @@ static double calc_hist_selectivity_scalar(TypeCacheEntry *typcache,
 										   const RangeBound *constbound,
 										   const RangeBound *hist, int hist_nvalues,
 										   bool equal);
+static double calc_hist_join_selectivity(TypeCacheEntry *typcache,
+										 VariableStatData *vardata1, VariableStatData *vardata2,
+										 Oid operator);
+static double calc_hist_join_selectivity_hist(TypeCacheEntry *typcache,
+										 const RangeBound *hist1, int hist1_nvalues,
+										 const RangeBound *hist2, int hist2_nvalues,
+										 bool equal);
 static int	rbound_bsearch(TypeCacheEntry *typcache, const RangeBound *value,
 						   const RangeBound *hist, int hist_length, bool equal);
 static float8 get_position(TypeCacheEntry *typcache, const RangeBound *value,
@@ -364,6 +372,48 @@ calc_rangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
 }
 
 /*
+ * Returns a default join selectivity estimate for given operator, when we don't
+ * have statistics or cannot use them for some reason.
+ */
+static double
+default_range_join_selectivity(Oid operator)
+{
+	switch (operator)
+	{
+		case OID_RANGE_OVERLAP_OP:
+			return 0.01;
+
+		case OID_RANGE_CONTAINS_OP:
+		case OID_RANGE_CONTAINED_OP:
+			return 0.005;
+
+		case OID_RANGE_CONTAINS_ELEM_OP:
+		case OID_RANGE_ELEM_CONTAINED_OP:
+
+			/*
+			 * "range @> elem" is more or less identical to a scalar
+			 * inequality "A >= b AND A <= c".
+			 */
+			return DEFAULT_RANGE_INEQ_SEL;
+
+		case OID_RANGE_LESS_OP:
+		case OID_RANGE_LESS_EQUAL_OP:
+		case OID_RANGE_GREATER_OP:
+		case OID_RANGE_GREATER_EQUAL_OP:
+		case OID_RANGE_LEFT_OP:
+		case OID_RANGE_RIGHT_OP:
+		case OID_RANGE_OVERLAPS_LEFT_OP:
+		case OID_RANGE_OVERLAPS_RIGHT_OP:
+			/* these are similar to regular scalar inequalities */
+			return DEFAULT_INEQ_SEL;
+
+		default:
+			/* all range operators should be handled above, but just in case */
+			return 0.01;
+	}
+}
+
+/*
  * Calculate range operator selectivity using histograms of range bounds.
  *
  * This estimate is for the portion of values that are not empty and not
@@ -589,6 +639,148 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 
 
 /*
+ * Calculate range operator join selectivity using histograms of range bounds.
+ *
+ * This estimate is for the portion of values that are not empty and not
+ * NULL.
+ */
+static double
+calc_hist_join_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata1,
+					  VariableStatData *vardata2, Oid operator)
+{
+    AttStatsSlot 	hslot1;
+    AttStatsSlot 	hslot2;
+    AttStatsSlot 	lslot1;
+    AttStatsSlot 	lslot2;
+    int       		nhist1;
+    int         	nhist2;
+    RangeBound 		*hist1_lower;
+    RangeBound 		*hist1_upper;
+    RangeBound 		*hist2_lower;
+    RangeBound 		*hist2_upper;
+    int         	i;
+    bool        	empty;
+
+	double 			hist_join_selec;
+
+	/* Can't use the histogram with insecure range support functions */
+	if (!statistic_proc_security_check(vardata1,
+									   typcache->rng_cmp_proc_finfo.fn_oid))
+		return -1;
+	if (!statistic_proc_security_check(vardata2,
+									   typcache->rng_cmp_proc_finfo.fn_oid))
+		return -1;
+	if (OidIsValid(typcache->rng_subdiff_finfo.fn_oid) &&
+		!statistic_proc_security_check(vardata1,
+									   typcache->rng_subdiff_finfo.fn_oid))
+		return -1;
+	if (OidIsValid(typcache->rng_subdiff_finfo.fn_oid) &&
+		!statistic_proc_security_check(vardata2,
+									   typcache->rng_subdiff_finfo.fn_oid))
+		return -1;
+
+	memset(&hslot1, 0, sizeof(hslot1));
+	memset(&hslot2, 0, sizeof(hslot2));
+	memset(&lslot1, 0, sizeof(hslot1));
+	memset(&lslot2, 0, sizeof(hslot2));
+
+	/* Try to get histogram of ranges of vardata1 */
+	if (!(HeapTupleIsValid(vardata1->statsTuple) &&
+		  get_attstatsslot(&hslot1, vardata1->statsTuple,
+						   STATISTIC_KIND_BOUNDS_HISTOGRAM, InvalidOid,
+						   ATTSTATSSLOT_VALUES)))
+		return -1.0;
+
+	/* check that it's a histogram, not just a dummy entry */
+	if (hslot1.nvalues < 2)
+	{
+		free_attstatsslot(&hslot1);
+		return -1.0;
+	}
+
+	/* Try to get histogram of ranges of vardata2 */
+	if (!(HeapTupleIsValid(vardata2->statsTuple) &&
+		  get_attstatsslot(&hslot2, vardata2->statsTuple,
+						   STATISTIC_KIND_BOUNDS_HISTOGRAM, InvalidOid,
+						   ATTSTATSSLOT_VALUES)))
+		return -1.0;
+
+	/* check that it's a histogram, not just a dummy entry */
+	if (hslot2.nvalues < 2)
+	{
+		free_attstatsslot(&hslot2);
+		return -1.0;
+	}
+
+	/*
+	 * Convert histogram of ranges into histograms of its lower and upper
+	 * bounds for vardata1.
+	 */
+    nhist1 = hslot1.nvalues;
+    hist1_lower = (RangeBound *) palloc(sizeof(RangeBound) * nhist1);
+    hist1_upper = (RangeBound *) palloc(sizeof(RangeBound) * nhist1);
+    for (i = 0; i < nhist1; i++)
+    {
+        range_deserialize(typcache, DatumGetRangeTypeP(hslot1.values[i]),
+                          &hist1_lower[i], &hist1_upper[i], &empty);
+        /* The histogram should not contain any empty ranges */
+        if (empty)
+            elog(ERROR, "bounds histogram contains an empty range");
+    }
+
+	/*
+	 * Convert histogram of ranges into histograms of its lower and upper
+	 * bounds for vardata2.
+	 */
+    nhist2 = hslot2.nvalues;
+    hist2_lower = (RangeBound *) palloc(sizeof(RangeBound) * nhist2);
+    hist2_upper = (RangeBound *) palloc(sizeof(RangeBound) * nhist2);
+    for (i = 0; i < nhist2; i++)
+    {
+        range_deserialize(typcache, DatumGetRangeTypeP(hslot2.values[i]),
+                          &hist2_lower[i], &hist2_upper[i], &empty);
+        /* The histogram should not contain any empty ranges */
+        if (empty)
+            elog(ERROR, "bounds histogram contains an empty range");
+    }
+
+	switch (operator)
+	{
+		case OID_RANGE_OVERLAP_OP:
+			hist_join_selec = 1
+				- calc_hist_join_selectivity_hist(typcache, hist1_upper, nhist1, hist2_lower, nhist2, false)
+				- calc_hist_join_selectivity_hist(typcache, hist2_upper, nhist2, hist1_lower, nhist1, false);
+			break;
+
+		case OID_RANGE_LEFT_OP:
+			hist_join_selec = 
+				calc_hist_join_selectivity_hist(typcache, hist1_upper, nhist1, hist2_lower, nhist2, false);
+
+		case OID_RANGE_RIGHT_OP:
+			hist_join_selec = 
+				calc_hist_join_selectivity_hist(typcache, hist2_upper, nhist2, hist1_lower, nhist1, false);
+
+		default:
+			elog(ERROR, "unknown range operator %u", operator);
+			hist_join_selec = -1.0;	/* keep compiler quiet */
+			break;
+	}
+
+
+    pfree(hist1_lower);
+    pfree(hist1_upper);
+    pfree(hist2_lower);
+    pfree(hist2_upper);
+
+    free_attstatsslot(&hslot1);
+    free_attstatsslot(&hslot2);
+    free_attstatsslot(&lslot1);
+    free_attstatsslot(&lslot2);
+
+	return hist_join_selec;
+}
+
+/*
  * Look up the fraction of values less than (or equal, if 'equal' argument
  * is true) a given const in a histogram of range bounds.
  */
@@ -612,6 +804,255 @@ calc_hist_selectivity_scalar(TypeCacheEntry *typcache, const RangeBound *constbo
 							  &hist[index + 1]) / (Selectivity) (hist_nvalues - 1);
 
 	return selec;
+}
+
+/*
+ * rangejoinsel -- join selectivity for range operators
+ */
+Datum
+rangejoinsel(PG_FUNCTION_ARGS)
+{
+    PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+    Oid         operator = PG_GETARG_OID(1);
+    List       *args = (List *) PG_GETARG_POINTER(2);
+    JoinType    jointype = (JoinType) PG_GETARG_INT16(3);
+    SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) PG_GETARG_POINTER(4);
+    Oid         collation = PG_GET_COLLATION();
+
+    VariableStatData vardata1;
+    VariableStatData vardata2;
+    Oid         opfuncoid;
+    TypeCacheEntry *typcache = NULL;
+    bool        join_is_reversed;
+	float4		empty_frac1,
+				null_frac1,
+				empty_frac2,
+				null_frac2;
+	double 		hist_join_selec;
+	Selectivity selec = 0.005;
+
+    get_join_variables(root, args, sjinfo,
+                       &vardata1, &vardata2, &join_is_reversed);
+    typcache = range_get_typcache(fcinfo, vardata1.vartype);
+    opfuncoid = get_opcode(operator);
+	
+	/*
+	 * First look up the fraction of NULLs and empty ranges from pg_statistic.
+	 */
+	if (HeapTupleIsValid(vardata1.statsTuple))
+	{
+		Form_pg_statistic stats;
+		AttStatsSlot sslot;
+		stats = (Form_pg_statistic) GETSTRUCT(vardata1.statsTuple);
+		null_frac1 = stats->stanullfrac;
+		/* Try to get fraction of empty ranges */
+		if (get_attstatsslot(&sslot, vardata1.statsTuple,
+							 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM,
+							 InvalidOid,
+							 ATTSTATSSLOT_NUMBERS))
+		{
+			if (sslot.nnumbers != 1)
+				elog(ERROR, "invalid empty fraction statistic");	/* shouldn't happen */
+			empty_frac1 = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+		else
+		{
+			empty_frac1 = 0.0;
+		}
+	}
+	else
+	{
+		null_frac1 = 0.0;
+		empty_frac1 = 0.0;
+	}
+	if (HeapTupleIsValid(vardata2.statsTuple))
+	{
+		Form_pg_statistic stats;
+		AttStatsSlot sslot;
+		stats = (Form_pg_statistic) GETSTRUCT(vardata2.statsTuple);
+		null_frac2 = stats->stanullfrac;
+		/* Try to get fraction of empty ranges */
+		if (get_attstatsslot(&sslot, vardata2.statsTuple,
+							 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM,
+							 InvalidOid,
+							 ATTSTATSSLOT_NUMBERS))
+		{
+			if (sslot.nnumbers != 1)
+				elog(ERROR, "invalid empty fraction statistic");	/* shouldn't happen */
+			empty_frac2 = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+		else
+		{
+			empty_frac2 = 0.0;
+		}
+	}
+	else
+	{
+		null_frac2 = 0.0;
+		empty_frac2 = 0.0;
+	}
+	
+	printf("null_frac1: %f\t empty_frac1:%f \n", null_frac1, empty_frac1);
+	printf("null_frac2: %f\t empty_frac2:%f \n", null_frac2, empty_frac2);
+
+	hist_join_selec = calc_hist_join_selectivity(typcache, &vardata1, &vardata2, operator);
+	if (hist_join_selec < 0.0)
+		hist_join_selec = default_range_join_selectivity(operator);
+
+	printf("hist_join_selec: %lf\n", hist_join_selec);
+	
+	if (operator == OID_RANGE_CONTAINED_OP)
+	{
+		/* empty is contained by anything non-empty */
+		/* special logic is needed after supporting this operator */
+	}
+	else
+	{
+		/* with any other operator, empty Op non-empty matches nothing */
+		selec = (1.0 - empty_frac1) * (1.0 - empty_frac2) * hist_join_selec;
+	}
+
+	/* all range operators are strict */
+	selec *= (1.0 - null_frac1) * (1.0 - null_frac2);
+
+	printf("selec: %lf\n", selec);
+	fflush(stdout);
+
+    ReleaseVariableStats(vardata1);
+    ReleaseVariableStats(vardata2);
+
+    CLAMP_PROBABILITY(selec);
+    PG_RETURN_FLOAT8((float8) selec);
+}
+
+
+/*
+ * Look up the fraction of values less than (or equal, if 'equal' argument
+ * is true) a histogram of range bounds in another histogram of range bounds.
+ * 
+ * The intuition is that the first histogram can be considered as a 
+ * distribution of const, and for each const we are able to call function 
+ * calc_hist_selectivity_scalar to compute its selectivity. By intergate with
+ * respect to the distribution, we obtain the said fraction.
+ */
+static double
+calc_hist_join_selectivity_hist(TypeCacheEntry *typcache, 
+						   const RangeBound *hist1, int hist1_nvalues,
+						   const RangeBound *hist2, int hist2_nvalues, 
+						   bool equal)
+{
+	int			i;
+    int         idx1;
+    int         idx2;
+    double      cur_selec;
+    const RangeBound  *chosed_bound;
+    const RangeBound  *old_bound;
+    int         cur_bin_idx;
+    double      cur_bin_area;
+    double      cur_bin_height;
+    double      trapezoid_base1;
+    double      trapezoid_base2;
+    double      trapezoid_height;
+    double      *area_values;
+	Selectivity selec;
+
+    idx1 = idx2 = 0;
+    cur_bin_idx = -1;
+    area_values = (double *) palloc(sizeof(double) * (hist1_nvalues - 1));
+    memset(area_values, 0, sizeof(double) * (hist1_nvalues - 1));
+    selec = 0;
+    
+    /* loop until finishing traversing all range bounds in hist1 */
+    while (idx1 < hist1_nvalues)
+    {
+        if (idx2 >= hist2_nvalues)
+        {
+            // finished reading lower2
+            if (cur_bin_idx < 0)
+            {
+                // area of every bin in upper1 is 0, finish
+                break;
+            }
+            else
+            {
+                area_values[cur_bin_idx] = (cur_bin_height == 0) ? 0 : cur_bin_area / cur_bin_height;
+                cur_bin_area = 0;
+                cur_bin_height = 0;
+                cur_bin_idx++;
+                idx1++;
+            }
+        }
+        else
+        {
+            if (range_cmp_bounds(typcache, &hist1[idx1], &hist2[idx2]) <= 0)
+            {
+                // upper is smaller
+                chosed_bound = &hist1[idx1];
+                cur_selec = 1 - calc_hist_selectivity_scalar(typcache, chosed_bound, hist2, hist2_nvalues, equal);
+                if (cur_bin_idx < 0)
+                {
+                    // first bin
+                    cur_bin_idx = 0;
+                }
+                else
+                {
+                    // finish a bin and move to a new one
+                    trapezoid_base2 = cur_selec;
+                    trapezoid_height = (double) DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+                                                                                typcache->rng_collation,
+                                                                                chosed_bound->val, 
+                                                                                old_bound->val));
+                    cur_bin_area += (trapezoid_base1 + trapezoid_base2) * trapezoid_height / 2;
+                    cur_bin_height += trapezoid_height;
+                    area_values[cur_bin_idx] = (cur_bin_height == 0) ? 0 : cur_bin_area / cur_bin_height;
+                    cur_bin_idx++;
+                }
+                cur_bin_area = 0;
+                cur_bin_height = 0;
+                trapezoid_base1 = cur_selec;
+                trapezoid_base2 = trapezoid_height = 0;
+                old_bound = chosed_bound;
+                idx1++;
+            }
+            else
+            {
+                // lower is smaller
+                chosed_bound = &hist2[idx2];
+                cur_selec = 1 - idx2 / (hist2_nvalues - 1.0);
+                if (cur_bin_idx < 0)
+                {
+                    idx2++;
+                    continue;
+                }
+                trapezoid_base2 = cur_selec;
+                trapezoid_height = (double) DatumGetFloat8(FunctionCall2Coll(&typcache->rng_subdiff_finfo,
+                                                                            typcache->rng_collation,
+                                                                            chosed_bound->val, 
+                                                                            old_bound->val));
+                cur_bin_area += (trapezoid_base1 + trapezoid_base2) * trapezoid_height / 2;
+                cur_bin_height += trapezoid_height;
+                trapezoid_base1 = cur_selec;
+                trapezoid_base2 = trapezoid_height = 0;
+                old_bound = chosed_bound;
+                idx2++;
+            }
+        }
+    }
+    
+    printf("area_values = [");
+    for (i = 0; i < (hist1_nvalues - 1); i++)
+    {
+        selec += area_values[i];
+        printf("%lf", area_values[i]);
+        if (i < hist1_nvalues - 2)
+            printf(", ");
+    }
+    printf("]\n");
+    pfree(area_values);
+    selec /= (hist1_nvalues - 1);
+    return selec;
 }
 
 /*

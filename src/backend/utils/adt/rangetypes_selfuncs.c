@@ -935,9 +935,9 @@ rangejoinsel(PG_FUNCTION_ARGS)
  * is true) a histogram of range bounds in another histogram of range bounds.
  * 
  * The intuition is that the first histogram can be considered as a 
- * distribution of const, and for each const we are able to call function 
- * calc_hist_selectivity_scalar to compute its selectivity. By intergate with
- * respect to the distribution, we obtain the said fraction.
+ * distribution of const bound, and for each const we can call the function 
+ * calc_hist_selectivity_scalar to compute its selectivity. By intergate them
+ * with respect to the distribution, we obtain the said fraction.
  */
 static double
 calc_hist_join_selectivity_hist(TypeCacheEntry *typcache, 
@@ -966,15 +966,23 @@ calc_hist_join_selectivity_hist(TypeCacheEntry *typcache,
     memset(area_values, 0, sizeof(double) * (hist1_nvalues - 1));
     selec = 0;
     
-    /* loop until finishing traversing all range bounds in hist1 */
+	/* Loop until finishing all range bounds in hist1.
+	 *
+	 * For each bin in hist1, we calculate its area_value through dividing 
+	 * the area under the selectivity curve within the bin by the length of 
+	 * the bin. The area_value represents the join selectivity contributed 
+	 * by this bin, regarding hist2. The average of all area_values 
+	 * represents the join selectivity of hist1 regarding hist2, as hist1 is
+	 * an Equi-Depth histogram and all bins take up the same weight.
+	 */
     while (idx1 < hist1_nvalues)
     {
+		/* loop until finishing traversing all range bounds in hist1 */
         if (idx2 >= hist2_nvalues)
         {
-            // finished reading lower2
+            /* range bounds in hist2 have been finished */
             if (cur_bin_idx < 0)
             {
-                // area of every bin in upper1 is 0, finish
                 break;
             }
             else
@@ -988,9 +996,9 @@ calc_hist_join_selectivity_hist(TypeCacheEntry *typcache,
         }
         else
         {
+			/* proceed with the smaller one between hist1[idx1] and hist2[idx2] */
             if (range_cmp_bounds(typcache, &hist1[idx1], &hist2[idx2]) <= 0)
             {
-                // upper is smaller
                 chosed_bound = &hist1[idx1];
                 cur_selec = 1 - calc_hist_selectivity_scalar(typcache, chosed_bound, hist2, hist2_nvalues, equal);
                 if (cur_bin_idx < 0)
@@ -1020,7 +1028,6 @@ calc_hist_join_selectivity_hist(TypeCacheEntry *typcache,
             }
             else
             {
-                // lower is smaller
                 chosed_bound = &hist2[idx2];
                 cur_selec = 1 - idx2 / (hist2_nvalues - 1.0);
                 if (cur_bin_idx < 0)
@@ -1053,6 +1060,7 @@ calc_hist_join_selectivity_hist(TypeCacheEntry *typcache,
     }
     printf("]\n");
     pfree(area_values);
+
     selec /= (hist1_nvalues - 1);
     return selec;
 }
